@@ -1,6 +1,7 @@
 """
 Command line interface for working with deployments.
 """
+import json
 from datetime import timedelta
 from enum import Enum
 from pathlib import Path
@@ -28,14 +29,14 @@ from prefect.exceptions import (
     ScriptError,
     exception_traceback,
 )
-from prefect.infrastructure import DockerContainer, KubernetesJob, Process
+from prefect.infrastructure.base import Block
 from prefect.orion.schemas.filters import FlowFilter
 from prefect.orion.schemas.schedules import (
     CronSchedule,
     IntervalSchedule,
     RRuleSchedule,
 )
-from prefect.utilities.callables import parameter_schema
+from prefect.utilities.dispatch import get_registry_for_type, lookup_type
 from prefect.utilities.filesystem import set_default_ignore_file
 
 
@@ -157,6 +158,109 @@ async def inspect(name: str):
             )
 
     app.console.print(Pretty(deployment_json))
+
+
+@deployment_app.command("set-schedule")
+async def set_schedule(
+    name: str,
+    interval: Optional[float] = typer.Option(
+        None,
+        "--interval",
+        help="An interval to schedule on, specified in seconds",
+    ),
+    interval_anchor: Optional[str] = typer.Option(
+        None, "--anchor-date", help="The anchor date for an interval schedule"
+    ),
+    rrule_string: Optional[str] = typer.Option(
+        None, "--rrule", help="Deployment schedule rrule string"
+    ),
+    cron_string: Optional[str] = typer.Option(
+        None, "--cron", help="Deployment schedule cron string"
+    ),
+    cron_day_or: Optional[str] = typer.Option(
+        None,
+        "--day_or",
+        help="Control how croniter handles `day` and `day_of_week` entries",
+    ),
+    timezone: Optional[str] = typer.Option(
+        None,
+        "--timezone",
+        help="Deployment schedule timezone string e.g. 'America/New_York'",
+    ),
+):
+    """
+    Set schedule for a given deployment.
+    """
+    assert_deployment_name_format(name)
+
+    interval_schedule = {
+        "interval": interval,
+        "interval_anchor": interval_anchor,
+        "timezone": timezone,
+    }
+    cron_schedule = {"cron": cron_string, "day_or": cron_day_or, "timezone": timezone}
+    rrule_schedule = {"rrule": rrule_string, "timezone": timezone}
+
+    def updated_schedule_check(schedule):
+        return any(v is not None for k, v in schedule.items() if k != "timezone")
+
+    updated_schedules = list(
+        filter(
+            updated_schedule_check, (interval_schedule, cron_schedule, rrule_schedule)
+        )
+    )
+
+    if len(updated_schedules) == 0:
+        exit_with_error("No deployment schedule updates provided")
+    if len(updated_schedules) > 1:
+        exit_with_error("Incompatible schedule parameters")
+
+    updated_schedule = {k: v for k, v in updated_schedules[0].items() if v is not None}
+
+    async with get_client() as client:
+        try:
+            deployment = await client.read_deployment_by_name(name)
+        except ObjectNotFound:
+            exit_with_error(f"Deployment {name!r} not found!")
+
+        await client.update_deployment(deployment, schedule=updated_schedule)
+        exit_with_success("Updated deployment schedule!")
+
+
+@deployment_app.command("pause-schedule")
+async def pause_schedule(
+    name: str,
+):
+    """
+    Pause schedule of a given deployment.
+    """
+    assert_deployment_name_format(name)
+    async with get_client() as client:
+        try:
+            deployment = await client.read_deployment_by_name(name)
+        except ObjectNotFound:
+            exit_with_error(f"Deployment {name!r} not found!")
+
+        await client.update_deployment(deployment, is_schedule_active=False)
+        exit_with_success(f"Paused schedule for deployment {name}")
+
+
+@deployment_app.command("resume-schedule")
+async def resume_schedule(
+    name: str,
+):
+    """
+    Resume schedule of a given deployment.
+    """
+    assert_deployment_name_format(name)
+    async with get_client() as client:
+        try:
+            deployment = await client.read_deployment_by_name(name)
+        except ObjectNotFound:
+            exit_with_error(f"Deployment {name!r} not found!")
+
+        await client.update_deployment(deployment, is_schedule_active=True)
+        exit_with_success(f"Resumed schedule for deployment {name}")
 
 
 @deployment_app.command()
@@ -311,7 +415,7 @@ async def apply(
         if deployment.work_queue_name is not None:
             app.console.print(
                 "\nTo execute flow runs from this deployment, start an agent "
-                f"that pulls work from the the {deployment.work_queue_name!r} work queue:"
+                f"that pulls work from the {deployment.work_queue_name!r} work queue:"
             )
             app.console.print(
                 f"$ prefect agent start -q {deployment.work_queue_name!r}", style="blue"
@@ -361,10 +465,14 @@ async def delete(
             exit_with_error("Must provide a deployment name or id")
 
 
-class Infra(str, Enum):
-    kubernetes = KubernetesJob.get_block_type_slug()
-    process = Process.get_block_type_slug()
-    docker = DockerContainer.get_block_type_slug()
+InfrastructureSlugs = Enum(
+    "InfastructureSlugs",
+    {
+        slug: slug
+        for slug, block in get_registry_for_type(Block).items()
+        if "run-infrastructure" in block.get_block_capabilities()
+    },
+)
 
 
 @deployment_app.command()
@@ -395,7 +503,7 @@ async def build(
             "Note that if a work queue is not set, work will not be scheduled."
         ),
     ),
-    infra_type: Infra = typer.Option(
+    infra_type: InfrastructureSlugs = typer.Option(
         None,
         "--infra",
         "-i",
@@ -455,6 +563,16 @@ async def build(
         "-a",
         help="An optional flag to automatically register the resulting deployment with the API.",
     ),
+    param: List[str] = typer.Option(
+        None,
+        "--param",
+        help="An optional parameter override, values are parsed as JSON strings e.g. --param question=ultimate --param answer=42",
+    ),
+    params: str = typer.Option(
+        None,
+        "--params",
+        help='An optional parameter override in a JSON string format e.g. --params=\'{"question": "ultimate", "answer": 42}\'',
+    ),
 ):
     """
     Generate a deployment YAML from /path/to/file.py:flow_function
@@ -512,12 +630,8 @@ async def build(
     if infra_block:
         infrastructure = await Block.load(infra_block)
     elif infra_type:
-        if infra_type == Infra.kubernetes:
-            infrastructure = KubernetesJob()
-        elif infra_type == Infra.docker:
-            infrastructure = DockerContainer()
-        elif infra_type == Infra.process:
-            infrastructure = Process()
+        # Create an instance of the given type
+        infrastructure = lookup_type(Block, infra_type.value)()
     else:
         # will reset to a default of Process is no infra is present on the
         # server-side definition of this deployment
@@ -529,7 +643,10 @@ async def build(
     elif interval:
         schedule = IntervalSchedule(interval=timedelta(seconds=interval))
     elif rrule:
-        schedule = RRuleSchedule(rrule=rrule)
+        try:
+            schedule = RRuleSchedule(**json.loads(rrule))
+        except json.JSONDecodeError:
+            schedule = RRuleSchedule(rrule=rrule)
 
     # parse storage_block
     if storage_block:
@@ -545,48 +662,74 @@ async def build(
     else:
         storage = None
 
-    ## docker default settings
-    # proxy for whether infra is docker-based
-    is_docker_based = hasattr(infrastructure, "image")
-
-    if not storage:
-        if is_docker_based:
-            # only update if a path is not already set
-            if not path:
-                path = "/opt/prefect/flows"
-        else:
-            path = str(Path(".").absolute())
-
-    # set up deployment object
-    deployment = Deployment(name=name, flow_name=flow.name)
-    await deployment.load()  # load server-side settings, if any
-
-    flow_parameter_schema = parameter_schema(flow)
-    entrypoint = (
-        f"{Path(fpath).absolute().relative_to(Path('.').absolute())}:{obj_name}"
-    )
-    updates = dict(
-        path=path,
-        parameter_openapi_schema=flow_parameter_schema,
-        entrypoint=entrypoint,
-        description=deployment.description or flow.description,
-        version=version or deployment.version or flow.version,
-        tags=tags or None,
-        storage=storage,
-        infrastructure=infrastructure,
-        infra_overrides=infra_overrides or None,
-        schedule=schedule,
-        work_queue_name=work_queue_name,
-    )
-    await deployment.update(**updates, ignore_none=True)
-
-    ## process storage, move files around and process path logic
     if set_default_ignore_file(path="."):
         app.console.print(
             f"Default '.prefectignore' file written to {(Path('.') / '.prefectignore').absolute()}",
             style="green",
         )
 
+    if param and (params is not None):
+        exit_with_error("Can only pass one of `param` or `params` options")
+
+    parameters = dict()
+
+    if param:
+        for p in param or []:
+            k, unparsed_value = p.split("=", 1)
+            try:
+                v = json.loads(unparsed_value)
+                app.console.print(
+                    f"The parameter value {unparsed_value} is parsed as a JSON string"
+                )
+            except json.JSONDecodeError:
+                v = unparsed_value
+            parameters[k] = v
+
+    if params is not None:
+        parameters = json.loads(params)
+
+    # set up deployment object
+    entrypoint = (
+        f"{Path(fpath).absolute().relative_to(Path('.').absolute())}:{obj_name}"
+    )
+
+    init_kwargs = dict(
+        path=path,
+        entrypoint=entrypoint,
+        version=version,
+        storage=storage,
+        infra_overrides=infra_overrides or {},
+    )
+
+    if parameters:
+        init_kwargs["parameters"] = parameters
+
+    # if a schedule, tags, work_queue_name, or infrastructure are not provided via CLI,
+    # we let `build_from_flow` load them from the server
+    if schedule:
+        init_kwargs.update(schedule=schedule)
+    if tags:
+        init_kwargs.update(tags=tags)
+    if infrastructure:
+        init_kwargs.update(infrastructure=infrastructure)
+    if work_queue_name:
+        init_kwargs.update(work_queue_name=work_queue_name)
+
+    deployment_loc = output_file or f"{obj_name}-deployment.yaml"
+    deployment = await Deployment.build_from_flow(
+        flow=flow,
+        name=name,
+        output=deployment_loc,
+        skip_upload=False,
+        apply=False,
+        **init_kwargs,
+    )
+    app.console.print(
+        f"Deployment YAML created at '{Path(deployment_loc).absolute()!s}'.",
+        style="green",
+    )
+
+    # we process these separately for informative output
     if not skip_upload:
         if (
             deployment.storage
@@ -604,13 +747,6 @@ async def build(
                 style="green",
             )
 
-    deployment_loc = output_file or f"{obj_name}-deployment.yaml"
-    await deployment.to_yaml(deployment_loc)
-    app.console.print(
-        f"Deployment YAML created at '{Path(deployment_loc).absolute()!s}'.",
-        style="green",
-    )
-
     if _apply:
         deployment_id = await deployment.apply()
         app.console.print(
@@ -620,7 +756,7 @@ async def build(
         if deployment.work_queue_name is not None:
             app.console.print(
                 "\nTo execute flow runs from this deployment, start an agent "
-                f"that pulls work from the the {deployment.work_queue_name!r} work queue:"
+                f"that pulls work from the {deployment.work_queue_name!r} work queue:"
             )
             app.console.print(
                 f"$ prefect agent start -q {deployment.work_queue_name!r}", style="blue"

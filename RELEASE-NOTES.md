@@ -1,5 +1,78 @@
 # Prefect Release Notes
 
+## Release 2.4.0
+
+### Exciting New Features 🎉
+- Add `ECSTask` infrastructure block to run commands and flows on AWS ECS<br />
+    See [the documentation](https://prefecthq.github.io/prefect-aws/ecs/) in the [prefect-aws collection](https://prefecthq.github.io/prefect-aws/) and usage notes in the [infrastructure guide](https://docs.prefect.io/concepts/infrastructure/#ecstask)
+
+### Enhancements
+- Update the deployments CLI to better support CI/CD use cases — https://github.com/PrefectHQ/prefect/pull/6697
+- Improve database query performance by removing unnecessary SQL transactions — https://github.com/PrefectHQ/prefect/pull/6714
+- Update blocks to dispatch instance creation using slugs — https://github.com/PrefectHQ/prefect/pull/6622
+- Add flow run start times to flow run metadata in UI — https://github.com/PrefectHQ/prefect/pull/6743
+- Update default infrastructure command to be set at runtime — https://github.com/PrefectHQ/prefect/pull/6610
+- Allow environment variables to be "unset" in infrastructure blocks — https://github.com/PrefectHQ/prefect/pull/6650
+- Add favicon switching feature for flow and task run pages — https://github.com/PrefectHQ/prefect/pull/6794
+- Update `Deployment.infrastructure` to accept types outside of the core library i.e. custom infrastructure or from collections — https://github.com/PrefectHQ/prefect/pull/6674
+- Update `deployment build --rrule` input to allow start date and timezones — https://github.com/PrefectHQ/prefect/pull/6761
+
+### Fixes
+- Update crash detection to ignore abort signals — https://github.com/PrefectHQ/prefect/pull/6730
+- Protect against race condition with deployment schedules — https://github.com/PrefectHQ/prefect/pull/6673
+- Fix saving of block fields with aliases — https://github.com/PrefectHQ/prefect/pull/6758
+- Preserve task dependencies to futures passed as parameters in `.map` — https://github.com/PrefectHQ/prefect/pull/6701
+- Update task run orchestration to include latest metadata in context — https://github.com/PrefectHQ/prefect/pull/6791
+
+### Documentation
+- Task runner documentation fixes and clarifications — https://github.com/PrefectHQ/prefect/pull/6733
+- Add notes for Windows and Linux installation — https://github.com/PrefectHQ/prefect/pull/6750
+- Add a catalog of implementation recipes — https://github.com/PrefectHQ/prefect/pull/6408
+- Improve storage and file systems documentation — https://github.com/PrefectHQ/prefect/pull/6756
+- Add CSS for badges — https://github.com/PrefectHQ/prefect/pull/6655
+
+### Contributors
+* @robalar made their first contribution in https://github.com/PrefectHQ/prefect/pull/6701
+* @shraddhafalane made their first contribution in https://github.com/PrefectHQ/prefect/pull/6784
+
+## 2.3.2
+
+### Enhancements
+* UI displays an error message when backend is unreachable - https://github.com/PrefectHQ/prefect/pull/6670
+
+### Fixes
+* Fix issue where parameters weren't updated when a deployment was re-applied by @lennertvandevelde in https://github.com/PrefectHQ/prefect/pull/6668
+* Fix issues with stopping Orion on Windows machines - https://github.com/PrefectHQ/prefect/pull/6672
+* Fix issue with GitHub storage running in non-empty directories - https://github.com/PrefectHQ/prefect/pull/6693
+* Fix issue where some user-supplied values were ignored when creating new deployments - https://github.com/PrefectHQ/prefect/pull/6695
+
+### Collections
+* Added [prefect-fugue](https://fugue-project.github.io/prefect-fugue/) 
+
+### Contributors
+* @lennertvandevelde made their first contribution! — [https://github.com/PrefectHQ/prefect/pull/6668](https://github.com/PrefectHQ/prefect/pull/6668)
+
+## 2.3.1
+
+### Enhancements
+* Add sync compatibility to `run` for all infrastructure types — https://github.com/PrefectHQ/prefect/pull/6654
+* Update Docker container name collision log to `INFO` level for clarity — https://github.com/PrefectHQ/prefect/pull/6657
+* Refactor block documents queries for speed ⚡️ — https://github.com/PrefectHQ/prefect/pull/6645
+* Update block CLI to match standard styling — https://github.com/PrefectHQ/prefect/pull/6679
+
+### Fixes
+* Add `git` to the Prefect image — https://github.com/PrefectHQ/prefect/pull/6653
+* Update Docker container runs to be robust to container removal — https://github.com/PrefectHQ/prefect/pull/6656
+* Fix parsing of `PREFECT_TEST_MODE` in `PrefectBaseModel` — https://github.com/PrefectHQ/prefect/pull/6647
+* Fix handling of `.prefectignore` paths on Windows — https://github.com/PrefectHQ/prefect/pull/6680
+
+### Collections
+* [prefect-juptyer](https://prefecthq.github.io/prefect-jupyter/)
+
+### Contributors
+* @mars-f made their first contribution — https://github.com/PrefectHQ/prefect/pull/6639
+* @pdashk made their first contribution — https://github.com/PrefectHQ/prefect/pull/6640
+
 ## 2.3.0
 
 ### Exciting New Features 🎉
