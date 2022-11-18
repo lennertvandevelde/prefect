@@ -1,6 +1,7 @@
 """
 Utilities for extensions of and operations on Python collections.
 """
+import io
 import itertools
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterator as IteratorABC
@@ -12,7 +13,6 @@ from typing import (
     Callable,
     Dict,
     Generator,
-    Generic,
     Hashable,
     Iterable,
     Iterator,
@@ -27,6 +27,9 @@ from typing import (
 from unittest.mock import Mock
 
 import pydantic
+
+# Moved to `prefect.utilities.annotations` but preserved here for compatibility
+from prefect.utilities.annotations import Quote, quote  # noqa
 
 
 class AutoEnum(str, Enum):
@@ -132,13 +135,14 @@ def isiterable(obj: Any) -> bool:
     Excludes types that are iterable but typically used as singletons:
     - str
     - bytes
+    - IO objects
     """
     try:
         iter(obj)
     except TypeError:
         return False
     else:
-        return not isinstance(obj, (str, bytes))
+        return not isinstance(obj, (str, bytes, io.IOBase))
 
 
 def ensure_iterable(obj: Union[T, Iterable[T]]) -> Iterable[T]:
@@ -203,33 +207,6 @@ def batched_iterable(iterable: Iterable[T], size: int) -> Iterator[Tuple[T, ...]
         yield batch
 
 
-class Quote(Generic[T]):
-    """
-    Simple wrapper to mark an expression as a different type so it will not be coerced
-    by Prefect. For example, if you want to return a state from a flow without having
-    the flow assume that state.
-    """
-
-    def __init__(self, data: T) -> None:
-        self.data = data
-
-    def unquote(self) -> T:
-        return self.data
-
-
-def quote(expr: T) -> Quote[T]:
-    """
-    Create a `Quote` object
-
-    Examples:
-        >>> from prefect.utilities.collections import quote
-        >>> x = quote(1)
-        >>> x.unquote()
-        1
-    """
-    return Quote(expr)
-
-
 def visit_collection(
     expr,
     visit_fn: Callable[[Any], Any],
@@ -253,6 +230,7 @@ def visit_collection(
     - Dict (note: keys are also visited recursively)
     - Dataclass
     - Pydantic model
+    - Prefect annotations
 
     Args:
         expr (Any): a Python object or expression
@@ -290,7 +268,7 @@ def visit_collection(
         return result if return_data else None
 
     # Get the expression type; treat iterators like lists
-    typ = list if isinstance(expr, IteratorABC) else type(expr)
+    typ = list if isinstance(expr, IteratorABC) and isiterable(expr) else type(expr)
     typ = cast(type, typ)  # mypy treats this as 'object' otherwise and complains
 
     # Then visit every item in the expression if it is a collection
@@ -344,6 +322,7 @@ def visit_collection(
             result = model_instance
         else:
             result = None
+
     else:
         result = result if return_data else None
 
@@ -357,11 +336,11 @@ def remove_nested_keys(keys_to_remove: List[Hashable], obj):
 
     Args:
         keys_to_remove: A list of keys to remove from obj obj: The object to remove keys
-        from.
+            from.
 
     Returns:
         `obj` without keys matching an entry in `keys_to_remove` if `obj` is a
-        dictionary. `obj` if `obj` is not a dictionary.
+            dictionary. `obj` if `obj` is not a dictionary.
     """
     if not isinstance(obj, dict):
         return obj

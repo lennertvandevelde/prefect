@@ -1,9 +1,8 @@
 import { plugin as OrionDesign } from '@prefecthq/orion-design'
 import { plugin as PrefectDesign } from '@prefecthq/prefect-design'
-import { createPinia } from 'pinia'
 import { createApp } from 'vue'
 import router from './router'
-import { applyActiveColorModeClass } from './utilities/colorMode'
+import { initColorMode } from './utilities/colorMode'
 
 // styles
 import '@prefecthq/prefect-design/dist/style.css'
@@ -14,13 +13,12 @@ import '@/styles/style.css'
 // eslint-disable-next-line import/order
 import App from './App.vue'
 
-applyActiveColorModeClass()
+initColorMode()
 
 function start(): void {
   const app = createApp(App)
 
   app.use(router)
-  app.use(createPinia())
   app.use(PrefectDesign)
   app.use(OrionDesign)
 

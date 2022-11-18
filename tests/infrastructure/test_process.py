@@ -25,7 +25,7 @@ def test_process_stream_output(capsys, stream_output):
 
     if not stream_output:
         assert err == ""
-        assert out == ""
+        assert "hello world" not in out.splitlines()
     else:
         assert "hello world" in out
 
@@ -38,8 +38,7 @@ def test_process_streams_stderr(capsys):
         command=["bash", "-c", ">&2 echo hello world"], stream_output=True
     ).run()
 
-    out, err = capsys.readouterr()
-    assert out == ""
+    _, err = capsys.readouterr()
     assert err.strip() == "hello world"
 
 
@@ -57,6 +56,22 @@ def test_process_runs_command(tmp_path):
     # Perform a side-effect to demonstrate the command is run
     assert Process(command=["touch", str(tmp_path / "canary")]).run()
     assert (tmp_path / "canary").exists()
+
+
+def test_process_runs_command_in_working_dir_str(tmpdir, capsys):
+    assert Process(
+        command=["bash", "-c", "pwd"], stream_output=True, working_dir=str(tmpdir)
+    ).run()
+    out, _ = capsys.readouterr()
+    assert str(tmpdir) in out
+
+
+def test_process_runs_command_in_working_dir_path(tmp_path, capsys):
+    assert Process(
+        command=["bash", "-c", "pwd"], stream_output=True, working_dir=tmp_path
+    ).run()
+    out, _ = capsys.readouterr()
+    assert str(tmp_path) in out
 
 
 def test_process_environment_variables(monkeypatch, mock_open_process):
@@ -140,3 +155,33 @@ async def test_prepare_for_flow_run_uses_sys_executable(
     flow_run = await orion_client.create_flow_run_from_deployment(deployment.id)
     infrastructure = Process().prepare_for_flow_run(flow_run)
     assert infrastructure.command == [sys.executable, "-m", "prefect.engine"]
+
+
+@pytest.mark.parametrize(
+    "exit_code,help_message",
+    [
+        (-9, "This indicates that the process exited due to a SIGKILL signal"),
+        (
+            247,
+            "This indicates that the process was terminated due to high memory usage.",
+        ),
+    ],
+)
+def test_process_logs_exit_code_help_message(
+    exit_code, help_message, caplog, monkeypatch
+):
+
+    # We need to use a monkeypatch because `bash -c "exit -9"`` returns a 247
+    class fake_process:
+        returncode = exit_code
+        pid = 0
+
+    mock = AsyncMock(return_value=fake_process)
+    monkeypatch.setattr("prefect.infrastructure.process.run_process", mock)
+
+    result = Process(command=["noop"]).run()
+    assert result.status_code == exit_code
+
+    record = caplog.records[-1]
+    assert record.levelname == "ERROR"
+    assert help_message in record.message

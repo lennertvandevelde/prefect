@@ -5,28 +5,136 @@ Objects for specifying deployments and utilities for loading flows from deployme
 import importlib
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
+import anyio
+import pendulum
 import yaml
 from pydantic import BaseModel, Field, parse_obj_as, validator
 
 from prefect.blocks.core import Block
-from prefect.client import OrionClient, get_client
-from prefect.client.orion import inject_client
-from prefect.context import PrefectObjectRegistry
-from prefect.exceptions import BlockMissingCapabilities, ObjectNotFound
+from prefect.client.orion import OrionClient, get_client
+from prefect.client.utilities import inject_client
+from prefect.context import FlowRunContext, PrefectObjectRegistry
+from prefect.exceptions import (
+    BlockMissingCapabilities,
+    ObjectAlreadyExists,
+    ObjectNotFound,
+)
 from prefect.filesystems import LocalFileSystem
 from prefect.flows import Flow
 from prefect.infrastructure import Infrastructure, Process
 from prefect.logging.loggers import flow_run_logger
 from prefect.orion import schemas
+from prefect.states import Scheduled
+from prefect.tasks import Task
 from prefect.utilities.asyncutils import run_sync_in_worker_thread, sync_compatible
 from prefect.utilities.callables import ParameterSchema, parameter_schema
 from prefect.utilities.dispatch import lookup_type
-from prefect.utilities.filesystem import tmpchdir
+from prefect.utilities.filesystem import relative_path_to_current_platform, tmpchdir
 from prefect.utilities.importtools import import_object
+from prefect.utilities.slugify import slugify
+
+
+@sync_compatible
+@inject_client
+async def run_deployment(
+    name: str,
+    client: OrionClient = None,
+    parameters: dict = None,
+    scheduled_time: datetime = None,
+    flow_run_name: str = None,
+    timeout: float = None,
+    poll_interval: float = 5,
+):
+    """
+    Create a flow run for a deployment and return it after completion or a timeout.
+
+    This function will return when the created flow run enters any terminal state or
+    the timeout is reached. If the timeout is reached and the flow run has not reached
+    a terminal state, it will still be returned. When using a timeout, we suggest
+    checking the state of the flow run if completion is important moving forward.
+
+    Args:
+        name: The deployment name in the form: '<flow-name>/<deployment-name>'
+        parameters: Parameter overrides for this flow run. Merged with the deployment
+            defaults
+        scheduled_time: The time to schedule the flow run for, defaults to scheduling
+            the flow run to start now.
+        flow_run_name: A name for the created flow run
+        timeout: The amount of time to wait for the flow run to complete before
+            returning. Setting `timeout` to 0 will return the flow run immediately.
+            Setting `timeout` to None will allow this function to poll indefinitely.
+            Defaults to None
+        poll_interval: The number of seconds between polls
+    """
+    if timeout is not None and timeout < 0:
+        raise ValueError("`timeout` cannot be negative")
+
+    if scheduled_time is None:
+        scheduled_time = pendulum.now("UTC")
+
+    parameters = parameters or {}
+
+    deployment = await client.read_deployment_by_name(name)
+
+    flow_run_ctx = FlowRunContext.get()
+    if flow_run_ctx:
+        # This was called from a flow. Link the flow run as a subflow.
+        from prefect.engine import (
+            Pending,
+            _dynamic_key_for_task_run,
+            collect_task_run_inputs,
+        )
+
+        task_inputs = {
+            k: await collect_task_run_inputs(v) for k, v in parameters.items()
+        }
+
+        # Generate a task in the parent flow run to represent the result of the subflow
+        dummy_task = Task(
+            name=name,
+            fn=lambda: None,
+            version=deployment.version,
+        )
+        # Override the default task key to include the deployment name
+        dummy_task.task_key = f"{__name__}.run_deployment.{slugify(name)}"
+        parent_task_run = await client.create_task_run(
+            task=dummy_task,
+            flow_run_id=flow_run_ctx.flow_run.id,
+            dynamic_key=_dynamic_key_for_task_run(flow_run_ctx, dummy_task),
+            task_inputs=task_inputs,
+            state=Pending(),
+        )
+        parent_task_run_id = parent_task_run.id
+    else:
+        parent_task_run_id = None
+
+    flow_run = await client.create_flow_run_from_deployment(
+        deployment.id,
+        state=Scheduled(scheduled_time=scheduled_time),
+        parameters=parameters,
+        name=flow_run_name,
+        parent_task_run_id=parent_task_run_id,
+    )
+
+    flow_run_id = flow_run.id
+
+    if timeout == 0:
+        return flow_run
+
+    with anyio.move_on_after(timeout):
+        while True:
+            flow_run = await client.read_flow_run(flow_run_id)
+            flow_state = flow_run.state
+            if flow_state and flow_state.is_final():
+                return flow_run
+            await anyio.sleep(poll_interval)
+
+    return flow_run
 
 
 @inject_client
@@ -58,7 +166,7 @@ async def load_flow_from_flow_run(
         f"Loading flow for deployment {deployment.name!r}..."
     )
 
-    import_path = deployment.entrypoint
+    import_path = relative_path_to_current_platform(deployment.entrypoint)
 
     # for backwards compat
     if deployment.manifest_path:
@@ -476,12 +584,15 @@ class Deployment(BaseModel):
         return file_count
 
     @sync_compatible
-    async def apply(self, upload: bool = False) -> UUID:
+    async def apply(
+        self, upload: bool = False, work_queue_concurrency: int = None
+    ) -> UUID:
         """
         Registers this deployment with the API and returns the deployment's ID.
 
         Args:
             upload: if True, deployment files are automatically uploaded to remote storage
+            work_queue_concurrency: If provided, sets the concurrency limit on the deployment's work queue
         """
         if not self.name or not self.flow_name:
             raise ValueError("Both a deployment name and flow name must be set.")
@@ -499,6 +610,17 @@ class Deployment(BaseModel):
 
             if upload:
                 await self.upload_to_storage()
+
+            if self.work_queue_name and work_queue_concurrency is not None:
+                try:
+                    res = await client.create_work_queue(name=self.work_queue_name)
+                except ObjectAlreadyExists:
+                    res = await client.read_work_queue_by_name(
+                        name=self.work_queue_name
+                    )
+                await client.update_work_queue(
+                    res.id, concurrency_limit=work_queue_concurrency
+                )
 
             # we assume storage was already saved
             storage_document_id = getattr(self.storage, "_block_document_id", None)
@@ -531,14 +653,13 @@ class Deployment(BaseModel):
         name: str,
         output: str = None,
         skip_upload: bool = False,
+        ignore_file: str = ".prefectignore",
         apply: bool = False,
+        load_existing: bool = True,
         **kwargs,
     ) -> "Deployment":
         """
         Configure a deployment for a given flow.
-
-        Note that this method loads any settings that may already be configured for the named deployment
-        server-side (e.g., schedules, default parameter values, etc.).
 
         Args:
             flow: A flow function to deploy
@@ -546,7 +667,12 @@ class Deployment(BaseModel):
             output (optional): if provided, the full deployment specification will be written as a YAML
                 file in the location specified by `output`
             skip_upload: if True, deployment files are not automatically uploaded to remote storage
+            ignore_file: an optional path to a `.prefectignore` file that specifies filename patterns
+                to ignore when uploading to remote storage; if not provided, looks for `.prefectignore`
+                in the current working directory
             apply: if True, the deployment is automatically registered with the API
+            load_existing: if True, load any settings that may already be configured for the named deployment
+                server-side (e.g., schedules, default parameter values, etc.)
             **kwargs: other keyword arguments to pass to the constructor for the `Deployment` class
         """
         if not name:
@@ -573,7 +699,8 @@ class Deployment(BaseModel):
             entry_path = Path(flow_file).absolute().relative_to(Path(".").absolute())
             deployment.entrypoint = f"{entry_path}:{flow.fn.__name__}"
 
-        await deployment.load()
+        if load_existing:
+            await deployment.load()
 
         # set a few attributes for this flow object
         deployment.parameter_openapi_schema = parameter_schema(flow)
@@ -598,7 +725,7 @@ class Deployment(BaseModel):
                 deployment.storage
                 and "put-directory" in deployment.storage.get_block_capabilities()
             ):
-                await deployment.upload_to_storage()
+                await deployment.upload_to_storage(ignore_file=ignore_file)
 
         if output:
             await deployment.to_yaml(output)

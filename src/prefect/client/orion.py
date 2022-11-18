@@ -1,11 +1,10 @@
 import datetime
 import warnings
 from contextlib import AsyncExitStack
-from functools import wraps
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Union
 from uuid import UUID
 
-import anyio
+import httpcore
 import httpx
 import pendulum
 import pydantic
@@ -16,72 +15,37 @@ import prefect
 import prefect.exceptions
 import prefect.orion.schemas as schemas
 import prefect.settings
+import prefect.states
+from prefect.client.schemas import FlowRun, OrchestrationResult, TaskRun
+from prefect.deprecated.data_documents import DataDocument
 from prefect.logging import get_logger
 from prefect.orion.api.server import ORION_API_VERSION, create_app
-from prefect.orion.orchestration.rules import OrchestrationResult
-from prefect.orion.schemas.actions import LogCreate, WorkQueueCreate, WorkQueueUpdate
+from prefect.orion.schemas.actions import (
+    FlowRunNotificationPolicyCreate,
+    LogCreate,
+    WorkQueueCreate,
+    WorkQueueUpdate,
+)
 from prefect.orion.schemas.core import (
     BlockDocument,
     BlockSchema,
     BlockType,
+    FlowRunNotificationPolicy,
     QueueFilter,
-    TaskRun,
 )
-from prefect.orion.schemas.data import DataDocument
-from prefect.orion.schemas.filters import LogFilter
-from prefect.orion.schemas.states import Scheduled
+from prefect.orion.schemas.filters import FlowRunNotificationPolicyFilter, LogFilter
 from prefect.settings import (
     PREFECT_API_KEY,
     PREFECT_API_REQUEST_TIMEOUT,
     PREFECT_API_URL,
     PREFECT_ORION_DATABASE_CONNECTION_URL,
 )
-from prefect.utilities.asyncutils import asyncnullcontext
 
 if TYPE_CHECKING:
     from prefect.flows import Flow
     from prefect.tasks import Task
 
 from prefect.client.base import PrefectHttpxClient, app_lifespan_context
-
-
-def inject_client(fn):
-    """
-    Simple helper to provide a context managed client to a asynchronous function.
-
-    The decorated function _must_ take a `client` kwarg and if a client is passed when
-    called it will be used instead of creating a new one, but it will not be context
-    managed as it is assumed that the caller is managing the context.
-    """
-
-    @wraps(fn)
-    async def with_injected_client(*args, **kwargs):
-        import prefect.context
-
-        client = None
-        flow_run_ctx = prefect.context.FlowRunContext.get()
-        task_run_ctx = prefect.context.TaskRunContext.get()
-
-        if "client" in kwargs and kwargs["client"] is not None:
-            # Client provided in kwargs
-            client = kwargs["client"]
-            client_context = asyncnullcontext()
-        elif flow_run_ctx is not None or task_run_ctx is not None:
-            # Client available in context
-            client = (flow_run_ctx or task_run_ctx).client
-            client_context = asyncnullcontext()
-        else:
-            # A new client is needed
-            client_context = get_client()
-
-        # Removes existing client to allow it to be set by setdefault below
-        kwargs.pop("client", None)
-
-        async with client_context as new_client:
-            kwargs.setdefault("client", new_client or client)
-            return await fn(*args, **kwargs)
-
-    return with_injected_client
 
 
 def get_client(httpx_settings: dict = None) -> "OrionClient":
@@ -130,8 +94,6 @@ class OrionClient:
         if api_key:
             httpx_settings["headers"].setdefault("Authorization", f"Bearer {api_key}")
 
-        httpx_settings.setdefault("timeout", PREFECT_API_REQUEST_TIMEOUT.value())
-
         # Context management
         self._exit_stack = AsyncExitStack()
         self._ephemeral_app: Optional[FastAPI] = None
@@ -152,6 +114,27 @@ class OrionClient:
                 )
             httpx_settings.setdefault("base_url", api)
 
+            # See https://www.python-httpx.org/advanced/#pool-limit-configuration
+            httpx_settings.setdefault(
+                "limits",
+                httpx.Limits(
+                    # We see instability when allowing the client to open many connections at once.
+                    # Limiting concurrency results in more stable performance.
+                    max_connections=16,
+                    max_keepalive_connections=8,
+                    # The Prefect Cloud LB will keep connections alive for 30s.
+                    # Only allow the client to keep connections alive for 25s.
+                    keepalive_expiry=25,
+                ),
+            )
+
+            # See https://www.python-httpx.org/http2/
+            # Enabling HTTP/2 support on the client does not necessarily mean that your requests
+            # and responses will be transported over HTTP/2, since both the client and the server
+            # need to support HTTP/2. If you connect to a server that only supports HTTP/1.1 the
+            # client will use a standard HTTP/1.1 connection instead.
+            httpx_settings.setdefault("http2", True)
+
         # Connect to an in-process application
         elif isinstance(api, FastAPI):
             self._ephemeral_app = api
@@ -163,9 +146,42 @@ class OrionClient:
                 f"Unexpected type {type(api).__name__!r} for argument `api`. Expected 'str' or 'FastAPI'"
             )
 
+        # See https://www.python-httpx.org/advanced/#timeout-configuration
+        httpx_settings.setdefault(
+            "timeout",
+            httpx.Timeout(
+                connect=PREFECT_API_REQUEST_TIMEOUT.value(),
+                read=PREFECT_API_REQUEST_TIMEOUT.value(),
+                write=PREFECT_API_REQUEST_TIMEOUT.value(),
+                pool=PREFECT_API_REQUEST_TIMEOUT.value(),
+            ),
+        )
+
         self._client = PrefectHttpxClient(
             **httpx_settings,
         )
+
+        # See https://www.python-httpx.org/advanced/#custom-transports
+        #
+        # If we're using an HTTP/S client (not the ephemeral client), adjust the
+        # transport to add retries _after_ it is instantiated. If we alter the transport
+        # before instantiation, the transport will not be aware of proxies unless we
+        # reproduce all of the logic to make it so.
+        #
+        # Only alter the transport to set our default of 3 retries, don't modify any
+        # transport a user may have provided via httpx_settings.
+        #
+        # Making liberal use of getattr and isinstance checks here to avoid any
+        # surprises if the internals of httpx or httpcore change on us
+        if isinstance(api, str) and not httpx_settings.get("transport"):
+            transport_for_url = getattr(self._client, "_transport_for_url", None)
+            if callable(transport_for_url):
+                orion_transport = transport_for_url(httpx.URL(api))
+                if isinstance(orion_transport, httpx.AsyncHTTPTransport):
+                    pool = getattr(orion_transport, "_pool", None)
+                    if isinstance(pool, httpcore.AsyncConnectionPool):
+                        pool._retries = 3
+
         self.logger = get_logger("client")
 
     @property
@@ -185,9 +201,8 @@ class OrionClient:
         If successful, returns `None`.
         """
         try:
-            with anyio.fail_after(10):
-                await self._client.get("/health")
-                return None
+            await self._client.get("/health")
+            return None
         except Exception as exc:
             return exc
 
@@ -278,8 +293,7 @@ class OrionClient:
             offset: offset for the flow query
 
         Returns:
-            a list of [Flow model][prefect.orion.schemas.core.Flow] representation
-                of the flows
+            a list of Flow model representations of the flows
         """
         body = {
             "flows": (flow_filter.dict(json_compatible=True) if flow_filter else None),
@@ -313,7 +327,7 @@ class OrionClient:
             flow_name: the name of a flow
 
         Returns:
-            a fully hydrated [Flow model][prefect.orion.schemas.core.Flow]
+            a fully hydrated Flow model
         """
         response = await self._client.get(f"/flows/name/{flow_name}")
         return schemas.core.Flow.parse_obj(response.json())
@@ -324,20 +338,31 @@ class OrionClient:
         *,
         parameters: Dict[str, Any] = None,
         context: dict = None,
-        state: schemas.states.State = None,
+        state: prefect.states.State = None,
         name: str = None,
         tags: Iterable[str] = None,
-    ) -> schemas.core.FlowRun:
+        idempotency_key: str = None,
+        parent_task_run_id: UUID = None,
+    ) -> FlowRun:
         """
         Create a flow run for a deployment.
 
         Args:
-            deployment: The deployment model to create the flow run from
+            deployment_id: The deployment ID to create the flow run from
             parameters: Parameter overrides for this flow run. Merged with the
                 deployment defaults
             context: Optional run context data
             state: The initial state for the run. If not provided, defaults to
                 `Scheduled` for now. Should always be a `Scheduled` type.
+            name: An optional name for the flow run. If not provided, the server will
+                generate a name.
+            tags: An optional iterable of tags to apply to the flow run; these tags
+                are merged with the deployment's tags.
+            idempotency_key: Optional idempotency key for creation of the flow run.
+                If the key matches the key of an existing flow run, the existing run will
+                be returned instead of creating a new one.
+            parent_task_run_id: if a subflow run is being created, the placeholder task
+                run identifier in the parent flow
 
         Raises:
             httpx.RequestError: if Orion does not successfully create a run for any reason
@@ -347,22 +372,24 @@ class OrionClient:
         """
         parameters = parameters or {}
         context = context or {}
-        state = state or Scheduled()
+        state = state or prefect.states.Scheduled()
         tags = tags or []
 
         flow_run_create = schemas.actions.DeploymentFlowRunCreate(
             parameters=parameters,
             context=context,
-            state=state,
+            state=state.to_state_create(),
             tags=tags,
             name=name,
+            idempotency_key=idempotency_key,
+            parent_task_run_id=parent_task_run_id,
         )
 
         response = await self._client.post(
             f"/deployments/{deployment_id}/create_flow_run",
             json=flow_run_create.dict(json_compatible=True),
         )
-        return schemas.core.FlowRun.parse_obj(response.json())
+        return FlowRun.parse_obj(response.json())
 
     async def create_flow_run(
         self,
@@ -372,8 +399,8 @@ class OrionClient:
         context: dict = None,
         tags: Iterable[str] = None,
         parent_task_run_id: UUID = None,
-        state: schemas.states.State = None,
-    ) -> schemas.core.FlowRun:
+        state: "prefect.states.State" = None,
+    ) -> FlowRun:
         """
         Create a flow run for a flow.
 
@@ -383,8 +410,8 @@ class OrionClient:
             parameters: Parameter overrides for this flow run.
             context: Optional run context data
             tags: a list of tags to apply to this flow run
-            parent_task_run_id: if a subflow run is being created, the placeholder task run ID
-                of the parent flow
+            parent_task_run_id: if a subflow run is being created, the placeholder task
+                run identifier in the parent flow
             state: The initial state for the run. If not provided, defaults to
                 `Scheduled` for now. Should always be a `Scheduled` type.
 
@@ -398,7 +425,7 @@ class OrionClient:
         context = context or {}
 
         if state is None:
-            state = schemas.states.Pending()
+            state = prefect.states.Pending()
 
         # Retrieve the flow id
         flow_id = await self.create_flow(flow)
@@ -411,7 +438,7 @@ class OrionClient:
             context=context,
             tags=list(tags or []),
             parent_task_run_id=parent_task_run_id,
-            state=state,
+            state=state.to_state_create(),
             empirical_policy=schemas.core.FlowRunPolicy(
                 retries=flow.retries,
                 retry_delay=flow.retry_delay_seconds,
@@ -420,7 +447,7 @@ class OrionClient:
 
         flow_run_create_json = flow_run_create.dict(json_compatible=True)
         response = await self._client.post("/flow_runs/", json=flow_run_create_json)
-        flow_run = schemas.core.FlowRun.parse_obj(response.json())
+        flow_run = FlowRun.parse_obj(response.json())
 
         # Restore the parameters to the local objects to retain expectations about
         # Python objects
@@ -660,7 +687,8 @@ class OrionClient:
             name (str): a unique name for the work queue
 
         Raises:
-            httpx.StatusError: if no work queue is found
+            prefect.exceptions.ObjectNotFound: if no work queue is found
+            httpx.HTTPStatusError: other status errors
 
         Returns:
             schemas.core.WorkQueue: a work queue API object
@@ -706,7 +734,7 @@ class OrionClient:
         id: UUID,
         limit: int = 10,
         scheduled_before: datetime.datetime = None,
-    ) -> List[schemas.core.FlowRun]:
+    ) -> List[FlowRun]:
         """
         Read flow runs off a work queue.
 
@@ -721,7 +749,7 @@ class OrionClient:
             httpx.RequestError: If request fails
 
         Returns:
-            List[schemas.core.FlowRun]: a list of FlowRun objects read from the queue
+            List[FlowRun]: a list of FlowRun objects read from the queue
         """
         if scheduled_before is None:
             scheduled_before = pendulum.now()
@@ -739,7 +767,7 @@ class OrionClient:
                 raise prefect.exceptions.ObjectNotFound(http_exc=e) from e
             else:
                 raise
-        return pydantic.parse_obj_as(List[schemas.core.FlowRun], response.json())
+        return pydantic.parse_obj_as(List[FlowRun], response.json())
 
     async def read_work_queue(
         self,
@@ -771,6 +799,7 @@ class OrionClient:
         self,
         limit: int = None,
         offset: int = 0,
+        work_queue_filter: schemas.filters.WorkQueueFilter = None,
     ) -> List[schemas.core.WorkQueue]:
         """
         Query Orion for work queues.
@@ -778,17 +807,56 @@ class OrionClient:
         Args:
             limit: a limit for the query
             offset: an offset for the query
+            work_queue_filter: filter crieteria for work queues
 
         Returns:
-            a list of [WorkQueue model][prefect.orion.schemas.core.WorkQueue] representations
+            a list of WorkQueue model representations
                 of the work queues
         """
         body = {
             "limit": limit,
             "offset": offset,
+            "work_queues": (
+                work_queue_filter.dict(json_compatible=True)
+                if work_queue_filter
+                else None
+            ),
         }
         response = await self._client.post(f"/work_queues/filter", json=body)
         return pydantic.parse_obj_as(List[schemas.core.WorkQueue], response.json())
+
+    async def match_work_queues(
+        self,
+        prefixes: List[str],
+    ) -> List[schemas.core.WorkQueue]:
+        """
+        Query Orion for work queues with names with a specific prefix.
+
+        Args:
+            prefixes: a list of strings used to match work queue name prefixes
+
+        Returns:
+            a list of WorkQueue model representations
+                of the work queues
+        """
+        page_length = 100
+        current_page = 0
+        work_queues = []
+
+        while True:
+            new_queues = await self.read_work_queues(
+                offset=current_page * page_length,
+                limit=page_length,
+                work_queue_filter=schemas.filters.WorkQueueFilter(
+                    name=schemas.filters.WorkQueueFilterName(startswith_=prefixes)
+                ),
+            )
+            if not new_queues:
+                break
+            work_queues += new_queues
+            current_page += 1
+
+        return work_queues
 
     async def delete_work_queue_by_id(
         self,
@@ -902,7 +970,7 @@ class OrionClient:
                 json=block_document.dict(
                     json_compatible=True,
                     exclude_unset=True,
-                    include={"data"},
+                    include={"data", "merge_existing_data"},
                     include_secrets=True,
                 ),
             )
@@ -991,6 +1059,14 @@ class OrionClient:
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 raise prefect.exceptions.ObjectNotFound(http_exc=e) from e
+            elif (
+                e.response.status_code == status.HTTP_403_FORBIDDEN
+                and e.response.json()["detail"]
+                == "protected block types cannot be deleted."
+            ):
+                raise prefect.exceptions.ProtectedBlockError(
+                    "Protected block types cannot be deleted."
+                ) from e
             else:
                 raise
 
@@ -998,7 +1074,7 @@ class OrionClient:
         """
         Read all block types
         Raises:
-            httpx.RequestError
+            httpx.RequestError: if the block types were not found
 
         Returns:
             List of BlockTypes.
@@ -1010,7 +1086,7 @@ class OrionClient:
         """
         Read all block schemas
         Raises:
-            httpx.RequestError
+            httpx.RequestError: if a valid block schema was not found
 
         Returns:
             A BlockSchema.
@@ -1268,7 +1344,7 @@ class OrionClient:
             httpx.RequestError: If request fails
 
         Returns:
-            a [Deployment model][prefect.orion.schemas.core.Deployment] representation of the deployment
+            a Deployment model representation of the deployment
         """
         try:
             response = await self._client.get(f"/deployments/name/{name}")
@@ -1288,6 +1364,7 @@ class OrionClient:
         task_run_filter: schemas.filters.TaskRunFilter = None,
         deployment_filter: schemas.filters.DeploymentFilter = None,
         limit: int = None,
+        sort: schemas.sorting.DeploymentSort = None,
         offset: int = 0,
     ) -> schemas.core.Deployment:
         """
@@ -1303,7 +1380,7 @@ class OrionClient:
             offset: an offset for the deployment query
 
         Returns:
-            a list of [Deployment model][prefect.orion.schemas.core.Deployment] representation
+            a list of Deployment model representations
                 of the deployments
         """
         body = {
@@ -1321,6 +1398,7 @@ class OrionClient:
             ),
             "limit": limit,
             "offset": offset,
+            "sort": sort,
         }
         response = await self._client.post(f"/deployments/filter", json=body)
         return pydantic.parse_obj_as(List[schemas.core.Deployment], response.json())
@@ -1346,7 +1424,7 @@ class OrionClient:
             else:
                 raise
 
-    async def read_flow_run(self, flow_run_id: UUID) -> schemas.core.FlowRun:
+    async def read_flow_run(self, flow_run_id: UUID) -> FlowRun:
         """
         Query Orion for a flow run by id.
 
@@ -1354,7 +1432,7 @@ class OrionClient:
             flow_run_id: the flow run ID of interest
 
         Returns:
-            a [Flow Run model][prefect.orion.schemas.core.FlowRun] representation of the flow run
+            a Flow Run model representation of the flow run
         """
         try:
             response = await self._client.get(f"/flow_runs/{flow_run_id}")
@@ -1363,7 +1441,7 @@ class OrionClient:
                 raise prefect.exceptions.ObjectNotFound(http_exc=e) from e
             else:
                 raise
-        return schemas.core.FlowRun.parse_obj(response.json())
+        return FlowRun.parse_obj(response.json())
 
     async def read_flow_runs(
         self,
@@ -1375,7 +1453,7 @@ class OrionClient:
         sort: schemas.sorting.FlowRunSort = None,
         limit: int = None,
         offset: int = 0,
-    ) -> List[schemas.core.FlowRun]:
+    ) -> List[FlowRun]:
         """
         Query Orion for flow runs. Only flow runs matching all criteria will
         be returned.
@@ -1390,7 +1468,7 @@ class OrionClient:
             offset: offset for the flow run query
 
         Returns:
-            a list of [Flow Run model][prefect.orion.schemas.core.FlowRun] representation
+            a list of Flow Run model representations
                 of the flow runs
         """
         body = {
@@ -1412,14 +1490,13 @@ class OrionClient:
         }
 
         response = await self._client.post(f"/flow_runs/filter", json=body)
-        return pydantic.parse_obj_as(List[schemas.core.FlowRun], response.json())
+        return pydantic.parse_obj_as(List[FlowRun], response.json())
 
     async def set_flow_run_state(
         self,
         flow_run_id: UUID,
-        state: schemas.states.State,
+        state: "prefect.states.State",
         force: bool = False,
-        backend_state_data: schemas.data.DataDocument = None,
     ) -> OrchestrationResult:
         """
         Set the state of a flow run.
@@ -1429,39 +1506,22 @@ class OrionClient:
             state: the state to set
             force: if True, disregard orchestration logic when setting the state,
                 forcing the Orion API to accept the state
-            backend_state_data: an optional data document representing the state's data,
-                if provided it will override `state.data`
 
         Returns:
-            a [OrchestrationResult model][prefect.orion.orchestration.rules.OrchestrationResult]
-                representation of state orchestration output
+            an OrchestrationResult model representation of state orchestration output
         """
-        state_data = schemas.actions.StateCreate(
-            type=state.type,
-            name=state.name,
-            message=state.message,
-            data=backend_state_data or state.data,
-            state_details=state.state_details,
-        )
-        state_data.state_details.flow_run_id = flow_run_id
-
-        # Attempt to serialize the given data
-        try:
-            state_data_json = state_data.dict(json_compatible=True)
-        except TypeError:
-            # Drop the user data
-            state_data.data = None
-            state_data_json = state_data.dict(json_compatible=True)
+        state_create = state.to_state_create()
+        state_create.state_details.flow_run_id = flow_run_id
 
         response = await self._client.post(
             f"/flow_runs/{flow_run_id}/set_state",
-            json=dict(state=state_data_json, force=force),
+            json=dict(state=state_create.dict(json_compatible=True), force=force),
         )
         return OrchestrationResult.parse_obj(response.json())
 
     async def read_flow_run_states(
         self, flow_run_id: UUID
-    ) -> List[schemas.states.State]:
+    ) -> List[prefect.states.State]:
         """
         Query for the states of a flow run
 
@@ -1469,13 +1529,13 @@ class OrionClient:
             flow_run_id: the id of the flow run
 
         Returns:
-            a list of [State model][prefect.orion.schemas.states.State] representation
+            a list of State model representations
                 of the flow run states
         """
         response = await self._client.get(
             "/flow_run_states/", params=dict(flow_run_id=flow_run_id)
         )
-        return pydantic.parse_obj_as(List[schemas.states.State], response.json())
+        return pydantic.parse_obj_as(List[prefect.states.State], response.json())
 
     async def create_task_run(
         self,
@@ -1484,7 +1544,7 @@ class OrionClient:
         dynamic_key: str,
         name: str = None,
         extra_tags: Iterable[str] = None,
-        state: schemas.states.State = None,
+        state: prefect.states.State = None,
         task_inputs: Dict[
             str,
             List[
@@ -1516,7 +1576,7 @@ class OrionClient:
         tags = set(task.tags).union(extra_tags or [])
 
         if state is None:
-            state = schemas.states.Pending()
+            state = prefect.states.Pending()
 
         task_run_data = schemas.actions.TaskRunCreate(
             name=name,
@@ -1529,7 +1589,7 @@ class OrionClient:
                 retries=task.retries,
                 retry_delay=task.retry_delay_seconds,
             ),
-            state=state,
+            state=state.to_state_create(),
             task_inputs=task_inputs or {},
         )
 
@@ -1538,7 +1598,7 @@ class OrionClient:
         )
         return TaskRun.parse_obj(response.json())
 
-    async def read_task_run(self, task_run_id: UUID) -> schemas.core.TaskRun:
+    async def read_task_run(self, task_run_id: UUID) -> TaskRun:
         """
         Query Orion for a task run by id.
 
@@ -1546,10 +1606,10 @@ class OrionClient:
             task_run_id: the task run ID of interest
 
         Returns:
-            a [Task Run model][prefect.orion.schemas.core.TaskRun] representation of the task run
+            a Task Run model representation of the task run
         """
         response = await self._client.get(f"/task_runs/{task_run_id}")
-        return schemas.core.TaskRun.parse_obj(response.json())
+        return TaskRun.parse_obj(response.json())
 
     async def read_task_runs(
         self,
@@ -1561,7 +1621,7 @@ class OrionClient:
         sort: schemas.sorting.TaskRunSort = None,
         limit: int = None,
         offset: int = 0,
-    ) -> List[schemas.core.TaskRun]:
+    ) -> List[TaskRun]:
         """
         Query Orion for task runs. Only task runs matching all criteria will
         be returned.
@@ -1576,7 +1636,7 @@ class OrionClient:
             offset: an offset for the task run query
 
         Returns:
-            a list of [Task Run model][prefect.orion.schemas.core.TaskRun] representation
+            a list of Task Run model representations
                 of the task runs
         """
         body = {
@@ -1597,14 +1657,13 @@ class OrionClient:
             "offset": offset,
         }
         response = await self._client.post(f"/task_runs/filter", json=body)
-        return pydantic.parse_obj_as(List[schemas.core.TaskRun], response.json())
+        return pydantic.parse_obj_as(List[TaskRun], response.json())
 
     async def set_task_run_state(
         self,
         task_run_id: UUID,
-        state: schemas.states.State,
+        state: prefect.states.State,
         force: bool = False,
-        backend_state_data: schemas.data.DataDocument = None,
     ) -> OrchestrationResult:
         """
         Set the state of a task run.
@@ -1614,39 +1673,21 @@ class OrionClient:
             state: the state to set
             force: if True, disregard orchestration logic when setting the state,
                 forcing the Orion API to accept the state
-            backend_state_data: an optional orion data document representing the state's data,
-                if provided it will override `state.data`
 
         Returns:
-            a [OrchestrationResult model][prefect.orion.orchestration.rules.OrchestrationResult]
-                representation of state orchestration output
+            an OrchestrationResult model representation of state orchestration output
         """
-        state_data = schemas.actions.StateCreate(
-            name=state.name,
-            type=state.type,
-            message=state.message,
-            data=backend_state_data or state.data,
-            state_details=state.state_details,
-        )
-        state_data.state_details.task_run_id = task_run_id
-
-        # Attempt to serialize the given data
-        try:
-            state_data_json = state_data.dict(json_compatible=True)
-        except TypeError:
-            # Drop the user data
-            state_data.data = None
-            state_data_json = state_data.dict(json_compatible=True)
-
+        state_create = state.to_state_create()
+        state_create.state_details.task_run_id = task_run_id
         response = await self._client.post(
             f"/task_runs/{task_run_id}/set_state",
-            json=dict(state=state_data_json, force=force),
+            json=dict(state=state_create.dict(json_compatible=True), force=force),
         )
         return OrchestrationResult.parse_obj(response.json())
 
     async def read_task_run_states(
         self, task_run_id: UUID
-    ) -> List[schemas.states.State]:
+    ) -> List[prefect.states.State]:
         """
         Query for the states of a task run
 
@@ -1654,13 +1695,12 @@ class OrionClient:
             task_run_id: the id of the task run
 
         Returns:
-            a list of [State model][prefect.orion.schemas.states.State] representation
-                of the task run states
+            a list of State model representations of the task run states
         """
         response = await self._client.get(
             "/task_run_states/", params=dict(task_run_id=task_run_id)
         )
-        return pydantic.parse_obj_as(List[schemas.states.State], response.json())
+        return pydantic.parse_obj_as(List[prefect.states.State], response.json())
 
     async def create_logs(self, logs: Iterable[Union[LogCreate, dict]]) -> None:
         """
@@ -1674,6 +1714,80 @@ class OrionClient:
             for log in logs
         ]
         await self._client.post(f"/logs/", json=serialized_logs)
+
+    async def create_flow_run_notification_policy(
+        self,
+        block_document_id: UUID,
+        is_active: bool = True,
+        tags: List[str] = None,
+        state_names: List[str] = None,
+        message_template: Optional[str] = None,
+    ) -> UUID:
+        """
+        Create a notification policy for flow runs
+
+        Args:
+            block_document_id: The block document UUID
+            is_active: Whether the notification policy is active
+            tags: List of flow tags
+            state_names: List of state names
+            message_template: Notification message template
+        """
+        if tags is None:
+            tags = []
+        if state_names is None:
+            state_names = []
+
+        policy = FlowRunNotificationPolicyCreate(
+            block_document_id=block_document_id,
+            is_active=is_active,
+            tags=tags,
+            state_names=state_names,
+            message_template=message_template,
+        )
+        response = await self._client.post(
+            "/flow_run_notification_policies/",
+            json=policy.dict(json_compatible=True),
+        )
+
+        policy_id = response.json().get("id")
+        if not policy_id:
+            raise httpx.RequestError(f"Malformed response: {response}")
+
+        return UUID(policy_id)
+
+    async def read_flow_run_notification_policies(
+        self,
+        flow_run_notification_policy_filter: FlowRunNotificationPolicyFilter,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> List[FlowRunNotificationPolicy]:
+        """
+        Query Orion for flow run notification policies. Only policies matching all criteria will
+        be returned.
+
+        Args:
+            flow_run_notification_policy_filter: filter criteria for notification policies
+            limit: a limit for the notification policies query
+            offset: an offset for the notification policies query
+
+        Returns:
+            a list of FlowRunNotificationPolicy model representations
+                of the notification policies
+        """
+        body = {
+            "flow_run_notification_policy_filter": flow_run_notification_policy_filter.dict(
+                json_compatible=True
+            )
+            if flow_run_notification_policy_filter
+            else None,
+            "limit": limit,
+            "offset": offset,
+        }
+        response = await self._client.post(
+            "/flow_run_notification_policies/filter", json=body
+        )
+        return pydantic.parse_obj_as(List[FlowRunNotificationPolicy], response.json())
 
     async def read_logs(
         self, log_filter: LogFilter = None, limit: int = None, offset: int = None

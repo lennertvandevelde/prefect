@@ -10,7 +10,7 @@
     </template>
 
     <p-tabs v-if="deployment" :tabs="tabs">
-      <template #overview>
+      <template #description>
         <p-content secondary>
           <DeploymentDeprecatedMessage v-if="deployment.deprecated" />
           <template v-else-if="deployment.description">
@@ -31,12 +31,7 @@
       </template>
 
       <template #runs>
-        <FlowRunList v-if="flowRuns.length" :flow-runs="flowRuns" disabled :selected="[]" />
-        <PEmptyResults v-else>
-          <template #message>
-            No runs from the last 7 days
-          </template>
-        </PEmptyResults>
+        <FlowRunFilteredList :flow-run-filter="deploymentFilter" />
       </template>
     </p-tabs>
 
@@ -52,39 +47,33 @@
 </template>
 
 <script lang="ts" setup>
-  import { DeploymentDescription, FlowRunList, DeploymentDescriptionEmptyState, DeploymentDeprecatedMessage, PageHeadingDeployment, DeploymentDetails, ParametersTable, localization, useRecentFlowRunFilter } from '@prefecthq/orion-design'
+  import { DeploymentDescription, FlowRunFilteredList, DeploymentDescriptionEmptyState, DeploymentDeprecatedMessage, PageHeadingDeployment, DeploymentDetails, ParametersTable, localization, useRecentFlowRunFilter, useTabs, useWorkspaceApi } from '@prefecthq/orion-design'
   import { media } from '@prefecthq/prefect-design'
-  import { useSubscription, useRouteParam, useSubscriptionWithDependencies } from '@prefecthq/vue-compositions'
+  import { useSubscription, useRouteParam } from '@prefecthq/vue-compositions'
   import { computed, watch } from 'vue'
   import { useRouter } from 'vue-router'
   import { useToast } from '@/compositions'
   import { usePageTitle } from '@/compositions/usePageTitle'
   import { routes } from '@/router'
-  import { deploymentsApi } from '@/services/deploymentsApi'
-  import { flowRunsApi } from '@/services/flowRunsApi'
 
   const deploymentId = useRouteParam('id')
   const router = useRouter()
+  const api = useWorkspaceApi()
   const showToast = useToast()
 
   const subscriptionOptions = {
     interval: 300000,
   }
 
-  const tabs = computed(() => {
-    const values = ['Overview', 'Runs']
+  const computedTabs = computed(() => [
+    { label: 'Details', hidden: media.xl },
+    { label: 'Description' },
+    { label: 'Runs' },
+    { label: 'Parameters', hidden: deployment.value?.deprecated },
+  ])
+  const tabs = useTabs(computedTabs)
 
-    if (!deployment.value?.deprecated) {
-      values.push('Parameters')
-    }
-    if (!media.xl) {
-      values.push('Details')
-    }
-
-    return values
-  })
-
-  const deploymentSubscription = useSubscription(deploymentsApi.getDeployment, [deploymentId.value], subscriptionOptions)
+  const deploymentSubscription = useSubscription(api.deployments.getDeployment, [deploymentId.value], subscriptionOptions)
   const deployment = computed(() => deploymentSubscription.response)
 
   function routeToDeployments(): void {
@@ -92,11 +81,6 @@
   }
 
   const deploymentFilter = useRecentFlowRunFilter({ deployments: [deploymentId.value] })
-
-  const flowRunsFilterArgs = computed<Parameters<typeof flowRunsApi.getFlowRuns> | null>(() => deploymentId.value ? [deploymentFilter.value] : null)
-
-  const flowRunsSubscription = useSubscriptionWithDependencies(flowRunsApi.getFlowRuns, flowRunsFilterArgs)
-  const flowRuns = computed(() => flowRunsSubscription.response ?? [])
 
   const title = computed(() => {
     if (!deployment.value) {

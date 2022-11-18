@@ -31,6 +31,7 @@ from prefect.settings import (
     PREFECT_DEBUG_MODE,
     PREFECT_MEMO_STORE_PATH,
     PREFECT_MEMOIZE_BLOCK_AUTO_REGISTRATION,
+    PREFECT_ORION_DATABASE_CONNECTION_URL,
 )
 from prefect.utilities.hashing import hash_objects
 
@@ -38,7 +39,7 @@ TITLE = "Prefect Orion"
 API_TITLE = "Prefect Orion API"
 UI_TITLE = "Prefect Orion UI"
 API_VERSION = prefect.__version__
-ORION_API_VERSION = "0.8.0"
+ORION_API_VERSION = "0.8.3"
 
 logger = get_logger("orion")
 
@@ -263,31 +264,50 @@ def _memoize_block_auto_registration(fn: Callable[[], Awaitable[None]]):
         blocks_registry = get_registry_for_type(Block)
         collection_blocks_data = await _load_collection_blocks_data()
         current_blocks_loading_hash = hash_objects(
-            blocks_registry, collection_blocks_data, hash_algo=sha256
+            blocks_registry,
+            collection_blocks_data,
+            PREFECT_ORION_DATABASE_CONNECTION_URL.value(),
+            hash_algo=sha256,
         )
 
         memo_store_path = PREFECT_MEMO_STORE_PATH.value()
-        if memo_store_path.exists():
-            saved_blocks_loading_hash = toml.load(memo_store_path).get(
-                "block_auto_registration"
+        try:
+            if memo_store_path.exists():
+                saved_blocks_loading_hash = toml.load(memo_store_path).get(
+                    "block_auto_registration"
+                )
+                if (
+                    saved_blocks_loading_hash is not None
+                    and current_blocks_loading_hash == saved_blocks_loading_hash
+                ):
+                    if PREFECT_DEBUG_MODE.value():
+                        logger.debug(
+                            "Skipping block loading due to matching hash for block "
+                            "auto-registration found in memo store."
+                        )
+                    return
+        except Exception as exc:
+            logger.warn(
+                ""
+                f"Unable to read memo_store.toml from {PREFECT_MEMO_STORE_PATH} during "
+                f"block auto-registration: {exc!r}.\n"
+                "All blocks will be registered."
             )
-            if (
-                saved_blocks_loading_hash is not None
-                and current_blocks_loading_hash == saved_blocks_loading_hash
-            ):
-                if PREFECT_DEBUG_MODE.value():
-                    logger.debug(
-                        "Skipping block loading due to matching hash for block "
-                        "auto-registration found in memo store"
-                    )
-                return
 
         await fn(*args, **kwargs)
 
         if current_blocks_loading_hash is not None:
-            memo_store_path.write_text(
-                toml.dumps({"block_auto_registration": current_blocks_loading_hash})
-            )
+            try:
+                memo_store_path.write_text(
+                    toml.dumps({"block_auto_registration": current_blocks_loading_hash})
+                )
+            except Exception as exc:
+                logger.warn(
+                    f"Unable to write to memo_store.toml at {PREFECT_MEMO_STORE_PATH} "
+                    f"after block auto-registration: {exc!r}.\n Subsequent server start "
+                    "ups will perform block auto-registration, which may result in "
+                    "slower server startup."
+                )
 
     return wrapper
 
@@ -334,12 +354,13 @@ def create_app(
         from prefect.orion.models.block_registration import run_block_auto_registration
 
         db = provide_database_interface()
-
-        should_override = bool(os.environ.get("PREFECT_ORION_DEV_UPDATE_BLOCKS"))
-
         session = await db.session()
-        async with session:
-            await run_block_auto_registration(session=session)
+
+        try:
+            async with session:
+                await run_block_auto_registration(session=session)
+        except Exception as exc:
+            logger.warn(f"Error occurred during block auto-registration: {exc!r}")
 
     async def start_services():
         """Start additional services when the Orion API starts up."""

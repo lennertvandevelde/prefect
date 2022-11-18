@@ -5,6 +5,7 @@ import pytest
 from prefect.blocks import system
 from prefect.client import OrionClient
 from prefect.exceptions import ObjectNotFound
+from prefect.orion import models
 from prefect.settings import PREFECT_ORION_BLOCKS_REGISTER_ON_START, temporary_settings
 from prefect.testing.cli import invoke_and_assert
 
@@ -20,6 +21,13 @@ from prefect.blocks.core import Bloc
 class TestForFileRegister(Block):
     message: str
 """
+
+
+@pytest.fixture
+async def install_system_block_types(session):
+    return await models.block_registration._install_protected_system_blocks(
+        session=session
+    )
 
 
 def test_register_blocks_from_module():
@@ -132,37 +140,33 @@ def test_register_fails_on_multiple_options():
 
 
 def test_listing_blocks_when_none_are_registered():
-    expected_output = (
-        "ID",
-        "Type",
-        "Name",
-        "Slug",
-    )
-
     invoke_and_assert(
         ["block", "ls"],
-        expected_code=0,
-        expected_output_contains=expected_output,
-        expected_line_count=6,
+        expected_output_contains=(
+            f"""                           
+           ┏━━━━┳━━━━━━┳━━━━━━┳━━━━━━┓
+           ┃ ID ┃ Type ┃ Name ┃ Slug ┃
+           ┡━━━━╇━━━━━━╇━━━━━━╇━━━━━━┩
+           └────┴──────┴──────┴──────┘
+            """
+        ),
     )
 
 
 def test_listing_blocks_after_saving_a_block():
-    system.JSON(value="a casual test block").save("wildblock")
-
-    expected_output = (
-        "ID",
-        "Type",
-        "Name",
-        "Slug",
-        "wildblock",
-    )
+    block_id = system.JSON(value="a casual test block").save("wildblock")
 
     invoke_and_assert(
         ["block", "ls"],
-        expected_code=0,
-        expected_output_contains=expected_output,
-        expected_line_count=7,
+        expected_output_contains=(
+            f"""                           
+            ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┓
+            ┃ ID                                   ┃ Type ┃ Name      ┃ Slug           ┃
+            ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━┩
+            │ {block_id} │ JSON │ wildblock │ json/wildblock │
+            └──────────────────────────────────────┴──────┴───────────┴────────────────┘  
+            """
+        ),
     )
 
 
@@ -276,13 +280,9 @@ def test_deleting_a_block_type(tmp_path, orion_client):
         )
 
 
-def test_deleting_a_protected_block_type(tmp_path, orion_client):
-    invoke_and_assert(
-        ["block", "register", "-m", "prefect.blocks.system"],
-        expected_code=0,
-        expected_output_contains=["Successfully registered", "blocks"],
-    )
-
+def test_deleting_a_protected_block_type(
+    tmp_path, orion_client, install_system_block_types
+):
     expected_output = "is a protected block"
 
     invoke_and_assert(
