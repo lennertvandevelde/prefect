@@ -463,6 +463,7 @@ class OrionClient:
         name: Optional[str] = None,
         tags: Optional[Iterable[str]] = None,
         empirical_policy: Optional[schemas.core.FlowRunPolicy] = None,
+        infrastructure_pid: Optional[str] = None,
     ) -> httpx.Response:
         """
         Update a flow run's details.
@@ -477,6 +478,8 @@ class OrionClient:
                 merged with any existing policy.
             tags: An iterable of new tags for the flow run. These will not be merged with
                 any existing tags.
+            infrastructure_pid: The id of flow run as returned by an
+                infrastructure block.
 
         Returns:
             an `httpx.Response` object from the PATCH request
@@ -492,6 +495,8 @@ class OrionClient:
             params["tags"] = tags
         if empirical_policy is not None:
             params["empirical_policy"] = empirical_policy
+        if infrastructure_pid:
+            params["infrastructure_pid"] = infrastructure_pid
 
         flow_run_data = schemas.actions.FlowRunUpdate(**params)
 
@@ -1269,7 +1274,7 @@ class OrionClient:
 
     async def update_deployment(
         self,
-        deployment,
+        deployment: schemas.core.Deployment,
         schedule: schemas.schedules.SCHEDULE_TYPES = None,
         is_schedule_active: bool = None,
     ):
@@ -1512,11 +1517,17 @@ class OrionClient:
         """
         state_create = state.to_state_create()
         state_create.state_details.flow_run_id = flow_run_id
+        try:
+            response = await self._client.post(
+                f"/flow_runs/{flow_run_id}/set_state",
+                json=dict(state=state_create.dict(json_compatible=True), force=force),
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == status.HTTP_404_NOT_FOUND:
+                raise prefect.exceptions.ObjectNotFound(http_exc=e) from e
+            else:
+                raise
 
-        response = await self._client.post(
-            f"/flow_runs/{flow_run_id}/set_state",
-            json=dict(state=state_create.dict(json_compatible=True), force=force),
-        )
         return OrchestrationResult.parse_obj(response.json())
 
     async def read_flow_run_states(
